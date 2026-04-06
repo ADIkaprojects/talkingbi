@@ -2,7 +2,6 @@ import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from core.config import settings
 from core.logger import logger
 from core.llm_client import llm
@@ -63,7 +62,9 @@ async def session_status(session_id: str):
         "has_data": pipeline.current_df is not None,
         "message_count": len(pipeline.session_history),
         "db_name": pipeline.db_schema.db_name if pipeline.db_schema else None,
-        "data_shape": list(pipeline.current_df.shape) if pipeline.current_df is not None else None,
+        "data_shape": (
+            list(pipeline.current_df.shape) if pipeline.current_df is not None else None
+        ),
     }
 
 
@@ -76,28 +77,17 @@ async def delete_session(session_id: str):
     return {"status": "deleted", "session_id": session_id}
 
 
-_ALLOWED_PROVIDERS = ("openrouter", "groq", "ollama")
-
-
-class ProviderPayload(BaseModel):
-    provider: str
-
-
 @app.get("/llm/provider", tags=["llm"])
 async def get_llm_provider():
-    """Return the currently active LLM provider."""
-    return {"provider": llm.provider, "available": list(_ALLOWED_PROVIDERS)}
-
-
-@app.post("/llm/provider", tags=["llm"])
-async def set_llm_provider(payload: ProviderPayload):
-    """Switch the active LLM provider for all subsequent requests."""
-    if payload.provider not in _ALLOWED_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"provider must be one of {_ALLOWED_PROVIDERS}")
-    llm.set_provider(payload.provider)
-    return {"provider": llm.provider}
+    """Return automatic provider mode and available configured providers."""
+    return {
+        "provider": llm.provider,
+        "available": llm.configured_providers(),
+        "switching_enabled": False,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)

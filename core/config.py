@@ -5,12 +5,19 @@ from pathlib import Path
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    LLM_PROVIDER: str = "openrouter"
+    LLM_PROVIDER: str = "groq"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     GROQ_API_KEY: str = ""
     ASSEMBLYAI_API_KEY: str = ""
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_FALLBACK_MODELS: str = (
+        "qwen/qwen3.6-plus:free,"
+        "openai/gpt-oss-120b:free,"
+        "nousresearch/hermes-3-llama-3.1-405b:free,"
+        "arcee-ai/trinity-large-preview:free,"
+        "stepfun/step-3.5-flash:free"
+    )
     PRIMARY_MODEL: str = "meta-llama/llama-3.1-8b-instruct:free"
     CODE_MODEL: str = "qwen/qwen-2.5-coder-7b-instruct:free"
     EMBED_MODEL: str = "all-MiniLM-L6-v2"
@@ -54,7 +61,7 @@ for d in [
     settings.KNOWLEDGE_BASE_DIR,
     settings.UPLOAD_DIR,
     settings.CACHE_DIR,
-    "./data/cache/llm",   # Fix 7 — LLM response cache
+    "./data/cache/llm",  # Fix 7 — LLM response cache
     "./data/cache/voice",
     "./data/cache/whisper",
 ]:

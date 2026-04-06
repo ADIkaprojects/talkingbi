@@ -59,13 +59,6 @@ export async function getProvider(): Promise<ProviderInfo> {
   return request("/llm/provider");
 }
 
-export async function setProvider(provider: string): Promise<ProviderInfo> {
-  return request("/llm/provider", {
-    method: "POST",
-    body: JSON.stringify({ provider }),
-  });
-}
-
 // ─── Session ──────────────────────────────────────────────────────────────────
 
 export async function createSession(): Promise<SessionNewResponse> {

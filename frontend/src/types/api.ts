@@ -107,8 +107,9 @@ export interface Insight {
 // ─── Chat response union ──────────────────────────────────────────────────────
 
 export interface SQLResultResponse {
-  type: "sql_result";
+  type: "sql_result" | "sql";
   sql: string;
+  answer?: string;
   data: { columns: string[]; rows: unknown[][] };
   rows_returned: number;
   iterations?: number;

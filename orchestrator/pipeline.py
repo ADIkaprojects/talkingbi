@@ -4,6 +4,7 @@ import math
 import os
 import tempfile
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -46,6 +47,7 @@ class TalkingBIPipeline:
 
     def __init__(self, session_id: str = None):
         import uuid
+
         self.session_id = session_id or str(uuid.uuid4())
         self.store = SessionStore(self.session_id)
 
@@ -93,7 +95,7 @@ class TalkingBIPipeline:
             uploads = self.store.get_uploads()
             if not uploads:
                 return
-            last = uploads[0]   # get_uploads() returns most-recent first
+            last = uploads[0]  # get_uploads() returns most-recent first
             file_path = last.get("db_path")
             if not file_path or not Path(file_path).exists():
                 return
@@ -110,7 +112,9 @@ class TalkingBIPipeline:
             elif path.suffix.lower() == ".parquet":
                 df = pd.read_parquet(file_path)
             else:
-                logger.warning(f"[restore] Unsupported extension {path.suffix} — skipping")
+                logger.warning(
+                    f"[restore] Unsupported extension {path.suffix} — skipping"
+                )
                 return
 
             self.current_df = df
@@ -125,7 +129,9 @@ class TalkingBIPipeline:
             tmp_conn.execute("PRAGMA journal_mode=WAL")
             tmp_conn.execute("PRAGMA synchronous=NORMAL")
             tmp_conn.execute("PRAGMA cache_size=10000")
-            df.to_sql(table_name, tmp_conn, if_exists="replace", index=False, chunksize=5000)
+            df.to_sql(
+                table_name, tmp_conn, if_exists="replace", index=False, chunksize=5000
+            )
             tmp_conn.close()
             self._tmp_db_path = tmp_path
 
@@ -136,10 +142,11 @@ class TalkingBIPipeline:
                 daemon=True,
             )
             t.start()
-            logger.info(f"[restore] DataFrame restored ({len(df)} rows), SQL engine rebuilding")
+            logger.info(
+                f"[restore] DataFrame restored ({len(df)} rows), SQL engine rebuilding"
+            )
         except Exception as e:
             logger.warning(f"[restore] Could not restore session state: {e}")
-
 
     def connect_database(self, db_path: str) -> dict:
         """
@@ -166,7 +173,7 @@ class TalkingBIPipeline:
             explorer = DatabaseExplorer(
                 self.db_schema,
                 self.db_conn,
-                target_triplets=settings.MAX_EXPLORATION_STEPS,   # Fix 6
+                target_triplets=settings.MAX_EXPLORATION_STEPS,  # Fix 6
             )
             triplets = explorer.explore()
             kb.add_triplets(triplets)
@@ -231,12 +238,16 @@ class TalkingBIPipeline:
             os.close(tmp_fd)
 
             tmp_conn = sqlite3.connect(tmp_path)
-            tmp_conn.execute("PRAGMA journal_mode=WAL")    # concurrent reads during writes
+            tmp_conn.execute(
+                "PRAGMA journal_mode=WAL"
+            )  # concurrent reads during writes
             tmp_conn.execute("PRAGMA synchronous=NORMAL")  # ~50% fewer fsyncs vs FULL
-            tmp_conn.execute("PRAGMA cache_size=10000")    # ~40 MB page cache
+            tmp_conn.execute("PRAGMA cache_size=10000")  # ~40 MB page cache
             df.to_sql(
-                table_name, tmp_conn,
-                if_exists="replace", index=False,
+                table_name,
+                tmp_conn,
+                if_exists="replace",
+                index=False,
                 chunksize=5000,
             )
             tmp_conn.close()
@@ -265,7 +276,7 @@ class TalkingBIPipeline:
             "columns": list(df.columns),
             "dtypes": dict(df.dtypes.astype(str)),
             "preview": preview,
-            "kb_status": "building_in_background",   # Fix 1 — informs the caller
+            "kb_status": "building_in_background",  # Fix 1 — informs the caller
         }
 
         self.store.add_upload(
@@ -347,7 +358,10 @@ class TalkingBIPipeline:
         if rtype == "chart":
             _summary = f"Chart generated: {result.get('title') or result.get('chart_type', 'chart')}"
         elif rtype == "insights":
-            _summary = result.get("summary") or f"Discovered {len(result.get('insights', []))} insights"
+            _summary = (
+                result.get("summary")
+                or f"Discovered {len(result.get('insights', []))} insights"
+            )
         elif rtype in ("sql", "sql_result"):
             _summary = f"Query returned {result.get('rows_returned', 0)} rows"
         elif rtype == "hybrid":
@@ -356,7 +370,12 @@ class TalkingBIPipeline:
             _shape = result.get("shape", [0, 0])
             _summary = f"Data prepared: {_shape[0]} rows × {_shape[1]} columns"
         else:
-            _summary = result.get("answer") or result.get("error") or result.get("response") or str(result)[:500]
+            _summary = (
+                result.get("answer")
+                or result.get("error")
+                or result.get("response")
+                or str(result)[:500]
+            )
         self.store.add_message(
             "assistant",
             _summary,
@@ -397,22 +416,208 @@ class TalkingBIPipeline:
         with self._kb_lock:
             engine = self.sql_engine
 
+        # Fast-path common aggregate prompts to avoid long LLM retry loops
+        # under provider rate limits.
+        fast_fallback = self._fallback_simple_aggregate_query(
+            message,
+            reason="pre_llm_fast_path",
+        )
+        if fast_fallback:
+            return fast_fallback
+
         result = engine.query(message)
         if result.get("success"):
-            rows = result["result"]
+            rows = result["result"].get("rows", [])
             return {
-                "type": "sql",
+                "type": "sql_result",
                 "sql": result["sql"],
                 "answer": result.get("answer", ""),
                 "data": result["result"],
                 "rows_returned": len(rows) if rows else 0,
                 "iterations": result.get("iterations", 1),
             }
-        return {"type": "error", "error": f"SQL generation failed: {result.get('error')}"}
+
+        fallback = self._fallback_simple_aggregate_query(
+            message, reason="post_llm_failure"
+        )
+        if fallback:
+            return fallback
+
+        last_error = result.get("last_error")
+        if last_error:
+            return {
+                "type": "error",
+                "error": f"SQL generation failed: {result.get('error')} (last error: {last_error})",
+            }
+
+        return {
+            "type": "error",
+            "error": f"SQL generation failed: {result.get('error')}",
+        }
+
+    def _fallback_simple_aggregate_query(
+        self,
+        message: str,
+        reason: str = "post_llm_failure",
+    ) -> dict | None:
+        """Handle common aggregate intents when LLM SQL generation fails."""
+        if self.current_df is None or self.current_df.empty:
+            return None
+
+        df = self.current_df
+        lower = message.lower()
+        columns_lower = {c.lower(): c for c in df.columns}
+
+        dimension_aliases = {
+            "state": ["state", "statewise", "state-wise", "region"],
+            "country": ["country", "nation"],
+            "month": ["month"],
+            "year": ["year"],
+            "product_category": ["category", "product category", "product_category"],
+            "sub_category": ["sub category", "sub_category", "subcategory"],
+            "product": ["product", "item", "sku"],
+        }
+        group_col = None
+        for canonical, aliases in dimension_aliases.items():
+            if any(alias in lower for alias in aliases):
+                candidate = columns_lower.get(canonical)
+                if candidate:
+                    group_col = candidate
+                    break
+
+        metric_specs = [
+            (
+                ["sales", "revenue"],
+                ["revenue", "net_revenue", "sales", "gross_sales", "amount"],
+            ),
+            (["profit", "margin"], ["profit", "gross_margin", "margin"]),
+            (
+                ["cost", "expense", "cogs"],
+                ["cost", "cogs", "expense", "shipping_cost", "marketing_spend"],
+            ),
+            (
+                ["quantity", "qty", "units", "orders"],
+                ["order_quantity", "quantity", "qty"],
+            ),
+        ]
+
+        metric_cols = []
+        for trigger_words, candidates in metric_specs:
+            if not any(w in lower for w in trigger_words):
+                continue
+            for candidate in candidates:
+                col = columns_lower.get(candidate)
+                if (
+                    col
+                    and pd.api.types.is_numeric_dtype(df[col])
+                    and col not in metric_cols
+                ):
+                    metric_cols.append(col)
+                    break
+
+        if not metric_cols:
+            return None
+
+        if re.search(r"\b(avg|average|mean)\b", lower):
+            agg_fn = "mean"
+            sql_agg = "AVG"
+        elif re.search(r"\b(count|how many|number of)\b", lower):
+            agg_fn = "count"
+            sql_agg = "COUNT"
+        else:
+            agg_fn = "sum"
+            sql_agg = "SUM"
+
+        select_labels = []
+        for metric_col in metric_cols:
+            prefix = {"sum": "total", "mean": "avg", "count": "count"}.get(
+                agg_fn, agg_fn
+            )
+            select_labels.append((metric_col, f"{prefix}_{metric_col}"))
+
+        if group_col:
+            agg_map = {metric: agg_fn for metric, _ in select_labels}
+            grouped = df.groupby(group_col, dropna=False).agg(agg_map).reset_index()
+            grouped = grouped.rename(
+                columns={metric: label for metric, label in select_labels}
+            )
+            if select_labels:
+                grouped = grouped.sort_values(by=select_labels[0][1], ascending=False)
+            result_df = grouped
+        else:
+            values = {}
+            for metric, label in select_labels:
+                values[label] = getattr(df[metric], agg_fn)()
+            result_df = pd.DataFrame([values])
+
+        # Convert NaN/inf to None so JSON serialization is safe.
+        safe_rows = []
+        for row in result_df.itertuples(index=False):
+            serialized = []
+            for val in row:
+                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                    serialized.append(None)
+                elif pd.isna(val):
+                    serialized.append(None)
+                else:
+                    serialized.append(val)
+            safe_rows.append(serialized)
+
+        if reason == "pre_llm_fast_path":
+            logger.info(
+                "Using deterministic aggregate fast-path for query: {}",
+                message,
+            )
+        else:
+            logger.warning(
+                "SQL generation failed; using deterministic aggregate fallback for query: {}",
+                message,
+            )
+
+        if group_col:
+            select_sql = ", ".join(
+                [
+                    f'{sql_agg}("{metric}") AS "{label}"'
+                    for metric, label in select_labels
+                ]
+            )
+            synthetic_sql = (
+                f'SELECT "{group_col}", {select_sql} FROM uploaded_data '
+                f'GROUP BY "{group_col}" ORDER BY "{select_labels[0][1]}" DESC'
+            )
+            answer = f"Computed {sql_agg.lower()} for {', '.join(metric_cols)} grouped by {group_col}."
+            columns = [group_col] + [label for _, label in select_labels]
+        else:
+            select_sql = ", ".join(
+                [
+                    f'{sql_agg}("{metric}") AS "{label}"'
+                    for metric, label in select_labels
+                ]
+            )
+            synthetic_sql = f"SELECT {select_sql} FROM uploaded_data"
+            answer = f"Computed {sql_agg.lower()} for {', '.join(metric_cols)}."
+            columns = [label for _, label in select_labels]
+
+        return {
+            "type": "sql_result",
+            "sql": synthetic_sql,
+            "answer": answer,
+            "data": {
+                "columns": columns,
+                "rows": safe_rows[:50],
+            },
+            "rows_returned": min(len(safe_rows), 50),
+            "iterations": settings.MAX_ITER,
+            "fallback": "deterministic_aggregate",
+            "fallback_reason": reason,
+        }
 
     def _handle_data_prep(self, message: str) -> dict:
         if self.current_df is None:
-            return {"type": "error", "error": "No data loaded. Please upload a file first."}
+            return {
+                "type": "error",
+                "error": "No data loaded. Please upload a file first.",
+            }
 
         schema_prompt = f"""Extract target schema requirements from this message.
 Message: {message}
@@ -431,7 +636,11 @@ Return JSON: {{"columns": {{"col_name": "description"}}, "goal": "transformation
             result = reasoner.run()
         except Exception as e:
             logger.error(f"_handle_data_prep error: {e}", exc_info=True)
-            return {"type": "data_prep", "success": False, "error": f"Data preparation error: {e}"}
+            return {
+                "type": "data_prep",
+                "success": False,
+                "error": f"Data preparation error: {e}",
+            }
 
         if result["success"]:
             result_tables = result["result_tables"]
@@ -446,7 +655,11 @@ Return JSON: {{"columns": {{"col_name": "description"}}, "goal": "transformation
                 "preview": main_df.head(5).to_dict(orient="records"),
                 "turns": result.get("turns", 0),
             }
-        return {"type": "data_prep", "success": False, "error": "Data preparation failed"}
+        return {
+            "type": "data_prep",
+            "success": False,
+            "error": "Data preparation failed",
+        }
 
     def _handle_chart(self, message: str, chart_type_override: str = None) -> dict:
         try:
@@ -467,7 +680,10 @@ Return JSON: {{"columns": {{"col_name": "description"}}, "goal": "transformation
             extracted = self.data_extractor.extract(message, df)
 
             if not extracted.get("values"):
-                return {"type": "error", "error": "Could not extract relevant data for chart."}
+                return {
+                    "type": "error",
+                    "error": "Could not extract relevant data for chart.",
+                }
 
             chart_type = self.chart_selector.select(message, extracted)
             # Allow the caller (e.g. the /charts/generate endpoint) to override
@@ -491,7 +707,10 @@ Return JSON: {{"columns": {{"col_name": "description"}}, "goal": "transformation
                         "title": extracted.get("title", ""),
                     },
                 }
-            return {"type": "error", "error": f"Chart generation failed: {chart.get('error')}"}
+            return {
+                "type": "error",
+                "error": f"Chart generation failed: {chart.get('error')}",
+            }
         except Exception as e:
             logger.error(f"_handle_chart error: {e}", exc_info=True)
             return {"type": "error", "error": f"Chart generation error: {e}"}
@@ -585,10 +804,26 @@ Return JSON: {{"columns": {{"col_name": "description"}}, "goal": "transformation
         """Handle general conversation with context awareness."""
         if self.current_df is None and self.db_schema is None:
             data_keywords = [
-                "chart", "plot", "graph", "pie", "bar", "line",
-                "insight", "analyze", "analysis", "trend", "pattern",
-                "query", "sql", "data", "upload", "sales", "revenue",
-                "clean", "prepare", "summarize",
+                "chart",
+                "plot",
+                "graph",
+                "pie",
+                "bar",
+                "line",
+                "insight",
+                "analyze",
+                "analysis",
+                "trend",
+                "pattern",
+                "query",
+                "sql",
+                "data",
+                "upload",
+                "sales",
+                "revenue",
+                "clean",
+                "prepare",
+                "summarize",
             ]
             if any(w in message.lower() for w in data_keywords):
                 return {
@@ -606,7 +841,9 @@ Return JSON: {{"columns": {{"col_name": "description"}}, "goal": "transformation
                 }
 
         db_info = self.db_schema.db_name if self.db_schema else "None"
-        data_info = str(self.current_df.shape) if self.current_df is not None else "None"
+        data_info = (
+            str(self.current_df.shape) if self.current_df is not None else "None"
+        )
         context = f"Database: {db_info}, Current data shape: {data_info}"
 
         history_str = "\n".join(

@@ -5,7 +5,6 @@ import {
   User,
   Loader2,
   Volume2,
-  Table2,
   BarChart3,
   ChevronDown,
   Code2,
@@ -64,7 +63,7 @@ const PROGRESS_STEPS = ["Routing", "Processing", "Generating", "Done"];
 interface BaseMessage { id: number; role: "user" | "ai"; }
 interface TextMessage extends BaseMessage { kind: "text"; content: string; }
 interface SQLMessage extends BaseMessage {
-  kind: "sql"; sql: string; columns: string[];
+  kind: "sql"; summary: string; columns: string[];
   rows: unknown[][]; rowsReturned: number;
 }
 interface ChartMessage extends BaseMessage {
@@ -94,15 +93,36 @@ type Message =
   | TextMessage | SQLMessage | ChartMessage
   | InsightMessage | DataPrepMessage | HybridMessage;
 
+function formatSqlSummary(response: SQLResultResponse): string {
+  if (response.answer?.trim()) {
+    return response.answer.trim();
+  }
+
+  const cols = response.data?.columns ?? [];
+  const rows = response.data?.rows ?? [];
+  if (rows.length === 0) {
+    return "I ran the analysis, but no matching rows were found.";
+  }
+
+  if (rows.length === 1 && cols.length > 0 && cols.length <= 4) {
+    const firstRow = rows[0] as unknown[];
+    const parts = cols.map((c, i) => `${c}: ${String(firstRow[i] ?? "")}`);
+    return `Here is what I found: ${parts.join(", ")}.`;
+  }
+
+  return `I found ${response.rows_returned.toLocaleString()} rows. Here are the top results.`;
+}
+
 // ─── Response → Message builder ───────────────────────────────────────────────
 
 function buildAIMessage(response: ChatResponse): Message {
   const base = { id: Date.now() + 1, role: "ai" as const };
   switch (response.type) {
-    case "sql_result": {
+    case "sql_result":
+    case "sql": {
       const r = response as SQLResultResponse;
       return {
-        ...base, kind: "sql", sql: r.sql,
+        ...base, kind: "sql", summary: formatSqlSummary(r),
         columns: r.data?.columns ?? [], rows: r.data?.rows ?? [],
         rowsReturned: r.rows_returned,
       };
@@ -139,7 +159,9 @@ function buildAIMessage(response: ChatResponse): Message {
     case "error":
       return { ...base, kind: "text", content: `⚠️ ${mapError(response.error ?? "Unknown error")}` };
     default: {
-      const resp = (response as { response?: string }).response;
+      const resp = (response as { response?: string; answer?: string; summary?: string }).response
+        ?? (response as { answer?: string }).answer
+        ?? (response as { summary?: string }).summary;
       return { ...base, kind: "text", content: resp ?? "Done." };
     }
   }
@@ -157,24 +179,12 @@ function ChartTypeIcon({ type }: { type: string }) {
 
 // ─── Sub-renderers ────────────────────────────────────────────────────────────
 
-function SQLCard({ sql, columns, rows, rowsReturned }: {
-  sql: string; columns: string[]; rows: unknown[][]; rowsReturned: number;
+function SQLCard({ summary, columns, rows, rowsReturned }: {
+  summary: string; columns: string[]; rows: unknown[][]; rowsReturned: number;
 }) {
-  const [sqlOpen, setSqlOpen] = useState(false);
   return (
     <div className="space-y-2">
-      <Collapsible open={sqlOpen} onOpenChange={setSqlOpen}>
-        <CollapsibleTrigger className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors">
-          <Table2 size={13} />
-          <span>{sqlOpen ? "Hide SQL" : "Show SQL"}</span>
-          <ChevronDown size={12} className={`transition-transform duration-200 ${sqlOpen ? "rotate-180" : ""}`} />
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <pre className="mt-1 bg-secondary/60 px-3 py-2 rounded-lg text-[11px] text-primary whitespace-pre-wrap break-all font-mono">
-            {sql}
-          </pre>
-        </CollapsibleContent>
-      </Collapsible>
+      <p className="text-sm leading-relaxed">{summary}</p>
 
       {columns.length > 0 && (
         <div className="overflow-x-auto rounded-xl border border-border/40">
@@ -359,7 +369,7 @@ function MessageBubble({ msg }: { msg: Message }) {
 
   let content: React.ReactNode;
   if (msg.kind === "sql") {
-    content = <SQLCard sql={msg.sql} columns={msg.columns} rows={msg.rows} rowsReturned={msg.rowsReturned} />;
+    content = <SQLCard summary={msg.summary} columns={msg.columns} rows={msg.rows} rowsReturned={msg.rowsReturned} />;
   } else if (msg.kind === "chart") {
     content = (
       <ChartCard
@@ -491,10 +501,10 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
           continue;
         }
         // AI message — reconstruct based on stored intent
-        if ((m.intent === "sql" || m.intent === "sql_result") && m.sql) {
+        if (m.intent === "sql" || m.intent === "sql_result") {
           restored.push({
             id: counter++, role: "ai", kind: "sql",
-            sql: m.sql,
+            summary: m.content || `I found ${(m.rows_ret ?? 0).toLocaleString()} rows.`,
             columns: [], rows: [],
             rowsReturned: m.rows_ret ?? 0,
           });

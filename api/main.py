@@ -1,11 +1,11 @@
 import uuid
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 from core.config import settings
 from core.logger import logger
@@ -21,14 +21,18 @@ from api.routes import chat, data, charts, insights, voice
 # so every subsequent embed() call is instant.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Warming up embedding model...")
-    try:
-        from vector_store.embedder import embedder
-        embedder.embed("warmup")
-        logger.info("Embedding model ready.")
-    except Exception as e:
-        # Warmup failure is non-fatal — the model will still lazy-load on first use
-        logger.warning(f"Embedding warmup failed (will lazy-load): {e}")
+    def _warm_embedder() -> None:
+        logger.info("Warming up embedding model in background...")
+        try:
+            from vector_store.embedder import embedder
+
+            embedder.embed("warmup")
+            logger.info("Embedding model ready.")
+        except Exception as e:
+            # Warmup failure is non-fatal — the model will still lazy-load on first use
+            logger.warning(f"Embedding warmup failed (will lazy-load): {e}")
+
+    threading.Thread(target=_warm_embedder, daemon=True).start()
     yield
 
 
@@ -38,7 +42,7 @@ app = FastAPI(
     description="Conversational Business Intelligence powered by LLMs",
     docs_url="/docs",
     redoc_url="/redoc",
-    lifespan=lifespan,   # Fix 4 — replaces the old @app.on_event("startup") pattern
+    lifespan=lifespan,  # Fix 4 — replaces the old @app.on_event("startup") pattern
 )
 
 app.add_middleware(
@@ -91,10 +95,12 @@ async def session_status(session_id: str):
         "session_id": session_id,
         "has_db": pipeline.db_schema is not None,
         "has_data": pipeline.current_df is not None,
-        "kb_ready": pipeline._kb_ready,           # Fix 1 — new field
+        "kb_ready": pipeline._kb_ready,  # Fix 1 — new field
         "message_count": len(pipeline.session_history),
         "db_name": pipeline.db_schema.db_name if pipeline.db_schema else None,
-        "data_shape": list(pipeline.current_df.shape) if pipeline.current_df is not None else None,
+        "data_shape": (
+            list(pipeline.current_df.shape) if pipeline.current_df is not None else None
+        ),
     }
 
 
@@ -156,21 +162,76 @@ async def chart_suggestions(session_id: str):
     # Determine which chart types are applicable given the data shape
     chart_types: list[dict] = []
     if numeric_cols:
-        chart_types.append({"type": "bar", "label": "Bar Chart", "desc": "Compare values across categories"})
-        chart_types.append({"type": "horizontal_bar", "label": "Horizontal Bar", "desc": "Best for long category labels"})
-        chart_types.append({"type": "histogram", "label": "Histogram", "desc": "Distribution of a numeric field"})
+        chart_types.append(
+            {
+                "type": "bar",
+                "label": "Bar Chart",
+                "desc": "Compare values across categories",
+            }
+        )
+        chart_types.append(
+            {
+                "type": "horizontal_bar",
+                "label": "Horizontal Bar",
+                "desc": "Best for long category labels",
+            }
+        )
+        chart_types.append(
+            {
+                "type": "histogram",
+                "label": "Histogram",
+                "desc": "Distribution of a numeric field",
+            }
+        )
     if numeric_cols and (date_cols or cat_cols):
-        chart_types.append({"type": "line", "label": "Line Chart", "desc": "Trend over time or ordered series"})
-        chart_types.append({"type": "area", "label": "Area Chart", "desc": "Cumulative trend visualization"})
+        chart_types.append(
+            {
+                "type": "line",
+                "label": "Line Chart",
+                "desc": "Trend over time or ordered series",
+            }
+        )
+        chart_types.append(
+            {
+                "type": "area",
+                "label": "Area Chart",
+                "desc": "Cumulative trend visualization",
+            }
+        )
     if numeric_cols and cat_cols:
-        chart_types.append({"type": "pie", "label": "Pie Chart", "desc": "Part-to-whole for a category"})
-        chart_types.append({"type": "scatter", "label": "Scatter Plot", "desc": "Correlation between two numeric fields"})
+        chart_types.append(
+            {
+                "type": "pie",
+                "label": "Pie Chart",
+                "desc": "Part-to-whole for a category",
+            }
+        )
+        chart_types.append(
+            {
+                "type": "scatter",
+                "label": "Scatter Plot",
+                "desc": "Correlation between two numeric fields",
+            }
+        )
     if len(cat_cols) >= 1 and numeric_cols:
-        chart_types.append({"type": "grouped_bar", "label": "Grouped Bar", "desc": "Compare sub-groups side by side"})
-        chart_types.append({"type": "stacked_bar", "label": "Stacked Bar", "desc": "Show composition within groups"})
+        chart_types.append(
+            {
+                "type": "grouped_bar",
+                "label": "Grouped Bar",
+                "desc": "Compare sub-groups side by side",
+            }
+        )
+        chart_types.append(
+            {
+                "type": "stacked_bar",
+                "label": "Stacked Bar",
+                "desc": "Show composition within groups",
+            }
+        )
 
     # Build suggested prompts using actual column names via LLM
     from core.llm_client import llm
+
     prompt = f"""You are a data analyst assistant. Given the column names and types below,
 generate exactly 6 short, natural-language chart prompt suggestions a user could ask.
 
@@ -188,6 +249,7 @@ Rules:
 
     try:
         import json
+
         raw = llm.chat(prompt, json_mode=True, temperature=0.3, use_cache=True)
         cleaned = raw.strip()
         if cleaned.startswith("```"):
@@ -202,11 +264,15 @@ Rules:
         if numeric_cols and date_cols:
             suggestions.append(f"Line chart of {numeric_cols[0]} over {date_cols[0]}")
         if len(numeric_cols) >= 2:
-            suggestions.append(f"Scatter plot of {numeric_cols[0]} vs {numeric_cols[1]}")
+            suggestions.append(
+                f"Scatter plot of {numeric_cols[0]} vs {numeric_cols[1]}"
+            )
         if numeric_cols:
             suggestions.append(f"Distribution of {numeric_cols[0]} as histogram")
         if cat_cols and len(cat_cols) > 1 and numeric_cols:
-            suggestions.append(f"Grouped bar of {numeric_cols[0]} by {cat_cols[0]} and {cat_cols[1]}")
+            suggestions.append(
+                f"Grouped bar of {numeric_cols[0]} by {cat_cols[0]} and {cat_cols[1]}"
+            )
 
     return {"suggestions": suggestions, "chart_types": chart_types}
 
@@ -215,11 +281,14 @@ Rules:
 async def list_past_sessions():
     """List all saved session history DBs with their summaries (skips empty sessions)."""
     from core.session_store import SessionStore
+
     sessions_dir = Path("data/sessions")
     if not sessions_dir.exists():
         return {"sessions": []}
     results = []
-    for db_file in sorted(sessions_dir.glob("*.db"), key=lambda f: f.stat().st_mtime, reverse=True):
+    for db_file in sorted(
+        sessions_dir.glob("*.db"), key=lambda f: f.stat().st_mtime, reverse=True
+    ):
         sid = db_file.stem
         try:
             store = SessionStore(sid)
@@ -262,31 +331,17 @@ async def delete_past_session(session_id: str):
     return {"status": "deleted", "session_id": session_id}
 
 
-_ALLOWED_PROVIDERS = ("openrouter", "groq", "ollama")
-
-
-class ProviderPayload(BaseModel):
-    provider: str
-
-
 @app.get("/llm/provider", tags=["llm"])
 async def get_llm_provider():
-    """Return the currently active LLM provider."""
-    return {"provider": llm.provider, "available": list(_ALLOWED_PROVIDERS)}
-
-
-@app.post("/llm/provider", tags=["llm"])
-async def set_llm_provider(payload: ProviderPayload):
-    """Switch the active LLM provider for all subsequent requests."""
-    if payload.provider not in _ALLOWED_PROVIDERS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"provider must be one of {_ALLOWED_PROVIDERS}",
-        )
-    llm.set_provider(payload.provider)
-    return {"provider": llm.provider}
+    """Return automatic provider mode and available configured providers."""
+    return {
+        "provider": llm.provider,
+        "available": llm.configured_providers(),
+        "switching_enabled": False,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)

@@ -8,6 +8,7 @@ import pandas as pd
 
 try:
     import duckdb
+
     _DUCKDB_AVAILABLE = True
 except ImportError:
     _DUCKDB_AVAILABLE = False
@@ -60,7 +61,7 @@ class SchemaRepresentation:
     def _connect(self, db_path: str):
         if db_path.endswith(".duckdb") and _DUCKDB_AVAILABLE:
             return duckdb.connect(db_path)
-        return sqlite3.connect(db_path)
+        return sqlite3.connect(db_path, check_same_thread=False)
 
     def _field_hash(self, fields: list) -> str:
         """Generate unique 128-bit MD5 hash for a set of fields."""
@@ -104,8 +105,15 @@ class SchemaRepresentation:
                 if tname in tables:
                     tables[tname].shared_group = group
 
-        db_name = self.db_path.replace("\\", "/").split("/")[-1].replace(".db", "").replace(".duckdb", "")
-        return DatabaseSchema(db_name=db_name, tables=tables, shared_groups=shared_groups)
+        db_name = (
+            self.db_path.replace("\\", "/")
+            .split("/")[-1]
+            .replace(".db", "")
+            .replace(".duckdb", "")
+        )
+        return DatabaseSchema(
+            db_name=db_name, tables=tables, shared_groups=shared_groups
+        )
 
     def _extract_fields(self, table_name: str) -> list:
         fields = []
@@ -156,14 +164,10 @@ class SchemaRepresentation:
         except Exception:
             return 0
 
-    def _build_shared_groups(
-        self, sig_map: dict, tables: dict
-    ) -> dict:
+    def _build_shared_groups(self, sig_map: dict, tables: dict) -> dict:
         """Greedy selection of non-overlapping Shared Field Groups."""
         candidates = [
-            (fhash, tnames)
-            for fhash, tnames in sig_map.items()
-            if len(tnames) >= 2
+            (fhash, tnames) for fhash, tnames in sig_map.items() if len(tnames) >= 2
         ]
         candidates.sort(
             key=lambda x: (len(x[1]), len(tables[x[1][0]].fields)), reverse=True

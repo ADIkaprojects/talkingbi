@@ -10,6 +10,7 @@ from groq import AsyncGroq
 
 try:
     from faster_whisper import WhisperModel as _WhisperModel  # type: ignore[import-not-found]
+
     _LOCAL_WHISPER_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     _WhisperModel = None  # type: ignore[assignment]
@@ -17,6 +18,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     import edge_tts  # type: ignore[import-not-found]
+
     _EDGE_TTS_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     edge_tts = None  # type: ignore[assignment]
@@ -86,7 +88,7 @@ def _make_voice_answer(result: dict) -> str:
         if value:
             return str(value)
 
-    if result.get("type") == "sql":
+    if result.get("type") in ("sql", "sql_result"):
         rows = result.get("rows_returned", 0)
         return f"I ran the query and got {rows} rows."
 
@@ -173,12 +175,16 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
                     temperature=0.0,
                     condition_on_previous_text=False,
                 )
-                text = _clean_transcript_text(" ".join(segment.text.strip() for segment in segments))
+                text = _clean_transcript_text(
+                    " ".join(segment.text.strip() for segment in segments)
+                )
                 if text:
                     return text
                 raise RuntimeError("Local Whisper returned an empty transcript")
             except Exception as e:
-                logger.warning(f"Local Whisper transcription failed, falling back to hosted provider: {e}")
+                logger.warning(
+                    f"Local Whisper transcription failed, falling back to hosted provider: {e}"
+                )
 
         if settings.ASSEMBLYAI_API_KEY:
             try:
@@ -194,7 +200,9 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
                     raise RuntimeError(
                         "No spoken audio was detected. Please record a clear voice query and try again."
                     ) from e
-                logger.warning(f"AssemblyAI transcription failed. Falling back to Groq Whisper: {e}")
+                logger.warning(
+                    f"AssemblyAI transcription failed. Falling back to Groq Whisper: {e}"
+                )
 
         if settings.GROQ_API_KEY:
             with open(tmp_path, "rb") as f:

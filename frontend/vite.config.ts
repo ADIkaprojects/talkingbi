@@ -4,7 +4,10 @@ import path from "path";
 import { componentTagger } from "lovable-tagger";
 
 // https://vitejs.dev/config/
-export default defineConfig(({ mode }) => ({
+export default defineConfig(({ mode }) => {
+  const apiTarget = "http://127.0.0.1:8000";
+
+  return {
   server: {
     host: "::",
     port: 8080,
@@ -13,15 +16,15 @@ export default defineConfig(({ mode }) => ({
     },
     proxy: {
       // In development, forward /chat /data /charts /insights /session → FastAPI on :8000
-      "/chat":     { target: "http://localhost:8000", changeOrigin: true },
-      "/data":     { target: "http://localhost:8000", changeOrigin: true },
-      "/charts":   { target: "http://localhost:8000", changeOrigin: true },
-      "/insights": { target: "http://localhost:8000", changeOrigin: true },
-      "/voice":    { target: "http://localhost:8000", changeOrigin: true, ws: true },
-      "/sessions": { target: "http://localhost:8000", changeOrigin: true },
-      "/session":  { target: "http://localhost:8000", changeOrigin: true },
-      "/health":   { target: "http://localhost:8000", changeOrigin: true },
-      "/llm":      { target: "http://localhost:8000", changeOrigin: true },
+      "/chat":     { target: apiTarget, changeOrigin: true },
+      "/data":     { target: apiTarget, changeOrigin: true },
+      "/charts":   { target: apiTarget, changeOrigin: true },
+      "/insights": { target: apiTarget, changeOrigin: true },
+      "/voice":    { target: apiTarget, changeOrigin: true, ws: true },
+      "/sessions": { target: apiTarget, changeOrigin: true },
+      "/session":  { target: apiTarget, changeOrigin: true },
+      "/health":   { target: apiTarget, changeOrigin: true },
+      "/llm":      { target: apiTarget, changeOrigin: true },
     },
   },
   plugins: [
@@ -41,4 +44,5 @@ export default defineConfig(({ mode }) => ({
       "@tanstack/query-core",
     ],
   },
-}));
+  };
+});
