@@ -29,7 +29,7 @@ def _cache_key(prompt: str, system: str, model: str) -> str:
 
 class LLMClient:
     """
-    Unified LLM client supporting Ollama, Groq, and OpenRouter.
+    Unified LLM client with automatic cross-provider fallback.
 
     Fix 7 — chat() now supports an optional disk cache.
     Cache is enabled by default for structured/analytical calls
@@ -39,10 +39,33 @@ class LLMClient:
     """
 
     def __init__(self):
-        self.provider = settings.LLM_PROVIDER
+        # Exposed as "auto" to the API/Frontend; routing is handled internally.
+        self.provider = "auto"
         self.primary = settings.PRIMARY_MODEL
         self.code_model = settings.CODE_MODEL
         self.base_url = settings.OLLAMA_BASE_URL
+
+    def _provider_order(self) -> list[str]:
+        """
+        Build provider order once per request.
+
+        Groq is always preferred first when configured, then OpenRouter, then
+        local Ollama. This keeps latency/reliability predictable for live chat
+        while still preserving multi-provider resilience.
+        """
+        providers: list[str] = []
+        if settings.GROQ_API_KEY:
+            providers.append("groq")
+        if settings.OPENROUTER_API_KEY:
+            providers.append("openrouter")
+        if self.base_url:
+            providers.append("ollama")
+
+        return list(dict.fromkeys(providers))
+
+    def configured_providers(self) -> list[str]:
+        """Public read-only accessor for the effective provider chain."""
+        return self._provider_order()
 
     def chat(
         self,
@@ -51,7 +74,7 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: float = 0.1,
         json_mode: bool = False,
-        use_cache: bool = True,   # Fix 7 — new parameter
+        use_cache: bool = True,  # Fix 7 — new parameter
     ) -> str:
         """
         Send a chat prompt to the configured LLM provider.
@@ -84,20 +107,50 @@ class LLMClient:
                     # Corrupted cache entry — just proceed with a real LLM call
                     logger.warning(f"LLM cache read failed ({key[:8]}): {e}")
 
-        try:
-            if self.provider == "ollama":
-                response = self._ollama_chat(prompt, system, model, temperature, json_mode)
-            elif self.provider == "groq":
-                response = self._groq_chat(prompt, system, model, temperature, json_mode)
-            elif self.provider == "openrouter":
-                response = self._openrouter_chat(prompt, system, model, temperature, json_mode)
-            else:
-                raise LLMError(f"Unknown provider: {self.provider}")
-        except LLMError:
-            raise
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            raise LLMError(str(e)) from e
+        provider_order = self._provider_order()
+        if not provider_order:
+            raise LLMError(
+                "No LLM provider is configured. Set OPENROUTER_API_KEY or GROQ_API_KEY, "
+                "or run a local Ollama server."
+            )
+
+        response: Optional[str] = None
+        errors: list[str] = []
+
+        for idx, provider in enumerate(provider_order, start=1):
+            try:
+                if provider == "openrouter":
+                    response = self._openrouter_chat(
+                        prompt, system, model, temperature, json_mode
+                    )
+                elif provider == "groq":
+                    response = self._groq_chat(
+                        prompt, system, model, temperature, json_mode
+                    )
+                elif provider == "ollama":
+                    response = self._ollama_chat(
+                        prompt, system, model, temperature, json_mode
+                    )
+                else:
+                    raise LLMError(f"Unknown provider: {provider}")
+
+                if idx > 1:
+                    logger.info(f"LLM fallback successful via provider: {provider}")
+                break
+
+            except Exception as e:
+                err_msg = f"{provider}: {e}"
+                errors.append(err_msg)
+                if idx < len(provider_order):
+                    logger.warning(
+                        f"LLM provider '{provider}' failed ({idx}/{len(provider_order)}). "
+                        f"Trying '{provider_order[idx]}'."
+                    )
+                else:
+                    logger.error("All configured LLM providers failed.")
+
+        if response is None:
+            raise LLMError(" | ".join(errors))
 
         # Fix 7 — write to cache on successful response
         if use_cache:
@@ -144,7 +197,12 @@ class LLMClient:
         return resp.json()["message"]["content"]
 
     def _groq_chat(
-        self, prompt: str, system: str, model: str, temperature: float, json_mode: bool = False
+        self,
+        prompt: str,
+        system: str,
+        model: str,
+        temperature: float,
+        json_mode: bool = False,
     ) -> str:
         from groq import Groq, RateLimitError
 
@@ -166,10 +224,26 @@ class LLMClient:
 
         # Fallback models for each primary Groq model when rate limit is hit
         groq_fallback_map = {
-            "llama-3.3-70b-versatile": ["llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192"],
-            "llama-3.1-8b-instant": ["llama-3.3-70b-versatile", "llama3-70b-8192", "llama3-8b-8192"],
-            "llama3-70b-8192": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-8b-8192"],
-            "llama3-8b-8192": ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama3-70b-8192"],
+            "llama-3.3-70b-versatile": [
+                "llama-3.1-8b-instant",
+                "llama3-70b-8192",
+                "llama3-8b-8192",
+            ],
+            "llama-3.1-8b-instant": [
+                "llama-3.3-70b-versatile",
+                "llama3-70b-8192",
+                "llama3-8b-8192",
+            ],
+            "llama3-70b-8192": [
+                "llama-3.3-70b-versatile",
+                "llama-3.1-8b-instant",
+                "llama3-8b-8192",
+            ],
+            "llama3-8b-8192": [
+                "llama-3.1-8b-instant",
+                "llama-3.3-70b-versatile",
+                "llama3-70b-8192",
+            ],
         }
 
         groq_model = groq_model_map.get(model, "llama-3.1-8b-instant")
@@ -179,7 +253,9 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
 
         # Try primary model and then fallbacks on rate limit error
-        models_to_try = list(dict.fromkeys([groq_model] + groq_fallback_map.get(groq_model, [])))
+        models_to_try = list(
+            dict.fromkeys([groq_model] + groq_fallback_map.get(groq_model, []))
+        )
         last_error: Optional[Exception] = None
 
         for attempt, try_model in enumerate(models_to_try):
@@ -192,10 +268,12 @@ class LLMClient:
                 if json_mode:
                     kwargs["response_format"] = {"type": "json_object"}
                 completion = client.chat.completions.create(**kwargs)
-                
+
                 # Log fallback success
                 if attempt > 0:
-                    logger.info(f"Groq rate limit fallback successful: {groq_model} → {try_model}")
+                    logger.info(
+                        f"Groq rate limit fallback successful: {groq_model} → {try_model}"
+                    )
 
                 return completion.choices[0].message.content
 
@@ -217,13 +295,19 @@ class LLMClient:
                 last_error = e
                 err = str(e).lower()
                 is_model_decommissioned = (
-                    "model_decommissioned" in err or "decommissioned" in err or "no longer supported" in err
+                    "model_decommissioned" in err
+                    or "decommissioned" in err
+                    or "no longer supported" in err
                 )
                 is_model_missing = (
-                    "model_not_found" in err or "not found" in err or "does not exist" in err
+                    "model_not_found" in err
+                    or "not found" in err
+                    or "does not exist" in err
                 )
 
-                if (is_model_decommissioned or is_model_missing) and attempt < len(models_to_try) - 1:
+                if (is_model_decommissioned or is_model_missing) and attempt < len(
+                    models_to_try
+                ) - 1:
                     logger.warning(
                         f"Groq fallback model '{try_model}' failed: {e}. Trying next fallback..."
                     )
@@ -232,17 +316,9 @@ class LLMClient:
                 # For non-model errors, keep original behavior and fail fast.
                 raise
 
-        if settings.OPENROUTER_API_KEY:
-            logger.warning(
-                f"All Groq fallback models failed for '{model}'. Falling back to OpenRouter."
-            )
-            try:
-                return self._openrouter_chat(prompt, system, model, temperature, json_mode)
-            except Exception as openrouter_exc:
-                logger.error(f"OpenRouter fallback also failed: {openrouter_exc}")
-                raise
-
-        raise LLMError(str(last_error) if last_error else "Groq fallback models exhausted")
+        raise LLMError(
+            str(last_error) if last_error else "Groq fallback models exhausted"
+        )
 
     def _openrouter_chat(
         self,
@@ -253,56 +329,29 @@ class LLMClient:
         json_mode: bool,
     ) -> str:
         """Call OpenRouter's OpenAI-compatible chat completions endpoint with fallback support."""
-        
-        # Fallback models for each primary model when rate limit is hit
-        openrouter_fallback_map = {
-            "meta-llama/llama-3.1-8b-instruct:free": [
-                "qwen/qwen3.6-plus:free",
-                "stepfun/step-3.5-flash:free",
-                "arcee-ai/trinity-large-preview:free",
-                "openai/gpt-oss-120b:free",
-                "nousresearch/hermes-3-llama-3.1-405b:free",
-            ],
-            "meta-llama/llama-3.1-70b-instruct:free": [
-                "nousresearch/hermes-3-llama-3.1-405b:free",
-                "openai/gpt-oss-120b:free",
-                "arcee-ai/trinity-large-preview:free",
-                "stepfun/step-3.5-flash:free",
-                "qwen/qwen3.6-plus:free",
-            ],
-            "qwen/qwen-2.5-coder-7b-instruct:free": [
-                "stepfun/step-3.5-flash:free",
-                "arcee-ai/trinity-large-preview:free",
-                "qwen/qwen3.6-plus:free",
-                "openai/gpt-oss-120b:free",
-                "nousresearch/hermes-3-llama-3.1-405b:free",
-            ],
-            "mistralai/mistral-7b-instruct:free": [
-                "arcee-ai/trinity-large-preview:free",
-                "qwen/qwen3.6-plus:free",
-                "stepfun/step-3.5-flash:free",
-                "nousresearch/hermes-3-llama-3.1-405b:free",
-                "openai/gpt-oss-120b:free",
-            ],
-        }
-        
-        # Default fallback chain for unknown models
-        default_fallback = [
+        # Ranked by practical free-tier reliability/quality for OpenRouter.
+        # Can be overridden via OPENROUTER_FALLBACK_MODELS in .env (comma-separated).
+        env_fallbacks = [
+            m.strip()
+            for m in settings.OPENROUTER_FALLBACK_MODELS.split(",")
+            if m.strip()
+        ]
+        default_fallback = env_fallbacks or [
             "qwen/qwen3.6-plus:free",
-            "stepfun/step-3.5-flash:free",
-            "arcee-ai/trinity-large-preview:free",
             "openai/gpt-oss-120b:free",
             "nousresearch/hermes-3-llama-3.1-405b:free",
+            "arcee-ai/trinity-large-preview:free",
+            "stepfun/step-3.5-flash:free",
         ]
-        
+
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        
-        # Build list of models to try (primary + fallbacks)
-        models_to_try = [model] + openrouter_fallback_map.get(model, default_fallback)
-        
+
+        # Build list of models to try (primary + ranked fallbacks), deduped.
+        models_to_try = list(dict.fromkeys([model] + default_fallback))
+
         for attempt, try_model in enumerate(models_to_try):
             payload: dict = {
                 "model": try_model,
@@ -323,16 +372,18 @@ class LLMClient:
                 json=payload,
                 timeout=120,
             )
-            
+
             if resp.ok:
                 # Log fallback success
                 if attempt > 0:
-                    logger.info(f"OpenRouter rate limit fallback successful: {model} → {try_model}")
+                    logger.info(
+                        f"OpenRouter rate limit fallback successful: {model} → {try_model}"
+                    )
                 return resp.json()["choices"][0]["message"]["content"]
-            
+
             # Check if this is a rate limit or retriable error
             is_retriable = resp.status_code in (429, 500, 502, 503, 504)
-            
+
             if is_retriable and attempt < len(models_to_try) - 1:
                 try:
                     err_body = resp.json()
@@ -344,15 +395,19 @@ class LLMClient:
                     f"Falling back to '{models_to_try[attempt + 1]}'"
                 )
                 continue
-            
+
             # Handle json_mode fallback for unsupported models
-            if json_mode and resp.status_code in (400, 404, 422) and attempt < len(models_to_try) - 1:
+            if (
+                json_mode
+                and resp.status_code in (400, 404, 422)
+                and attempt < len(models_to_try) - 1
+            ):
                 logger.warning(
                     f"OpenRouter {resp.status_code} for model '{try_model}' with json_mode. "
                     f"Falling back to '{models_to_try[attempt + 1]}'"
                 )
                 continue
-            
+
             # Try json_mode retry without response_format for this model
             if json_mode and resp.status_code in (400, 404, 422):
                 payload.pop("response_format", None)
@@ -370,9 +425,11 @@ class LLMClient:
                 if retry.ok:
                     # Log fallback success
                     if attempt > 0:
-                        logger.info(f"OpenRouter fallback successful (json_mode retry): {model} → {try_model}")
+                        logger.info(
+                            f"OpenRouter fallback successful (json_mode retry): {model} → {try_model}"
+                        )
                     return retry.json()["choices"][0]["message"]["content"]
-            
+
             # If this is the last model or a non-retriable error, raise
             if attempt == len(models_to_try) - 1:
                 try:
@@ -386,13 +443,15 @@ class LLMClient:
                     "to find available free models."
                 )
                 resp.raise_for_status()
-        
+
         raise LLMError("All OpenRouter fallback models exhausted")
 
     def set_provider(self, provider: str) -> None:
-        """Switch the active LLM provider at runtime."""
-        self.provider = provider
-        logger.info(f"LLM provider switched to: {provider}")
+        """Runtime provider switching is disabled; provider order is automatic."""
+        logger.info(
+            "Ignoring runtime provider switch request. "
+            "TalkingBI now uses automatic multi-provider fallback."
+        )
 
     def embed(self, text: str) -> list:
         """Generate embeddings using local sentence-transformers."""

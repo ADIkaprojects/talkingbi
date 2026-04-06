@@ -1,4 +1,5 @@
 import json
+import re
 from core.llm_client import llm
 from core.config import settings
 from core.logger import logger
@@ -43,7 +44,8 @@ Return as JSON: {{"keywords": ["term1", "term2", ...]}}"""
             overlap = sum(
                 1
                 for kw in keywords
-                if any(kw.lower() in cn for cn in col_names) or kw.lower() in tname.lower()
+                if any(kw.lower() in cn for cn in col_names)
+                or kw.lower() in tname.lower()
             )
             if overlap > 0:
                 relevant_tables[tname] = {
@@ -54,7 +56,19 @@ Return as JSON: {{"keywords": ["term1", "term2", ...]}}"""
         sorted_tables = sorted(
             relevant_tables.items(), key=lambda x: x[1]["score"], reverse=True
         )
-        return dict(sorted_tables[: settings.TOP_K])
+        if sorted_tables:
+            return dict(sorted_tables[: settings.TOP_K])
+
+        # If keyword overlap is empty, keep generation grounded with a default
+        # schema slice instead of passing an empty context to the SQL model.
+        fallback_tables = list(self.schema.tables.items())[: settings.TOP_K]
+        return {
+            tname: {
+                "score": 0,
+                "fields": [{"name": f.name, "type": f.dtype} for f in table.fields],
+            }
+            for tname, table in fallback_tables
+        }
 
     def _expand_context(self, question: str, ctx: dict, feedback: dict = None) -> dict:
         """Use LLM to infer implicit dependencies like join keys."""
@@ -123,14 +137,48 @@ User Question: {question}
 
 Write a complete, executable SQL query. Return only the SQL, no explanation."""
 
-        sql = llm.chat(
+        raw_sql = llm.chat(
             prompt,
             system="You are an expert SQL analyst. Always return valid SQL only.",
             model=settings.CODE_MODEL,
             temperature=0.1,
-            use_cache=not bool(feedback),   # bypass cache when refining with feedback
+            use_cache=not bool(feedback),  # bypass cache when refining with feedback
         )
-        return sql.strip().replace("```sql", "").replace("```", "").strip()
+        return self._extract_sql(raw_sql)
+
+    @staticmethod
+    def _extract_sql(raw_text: str) -> str:
+        """Normalize model output to a single executable SQL statement."""
+        text = (raw_text or "").strip()
+        if not text:
+            return ""
+
+        # Prefer fenced SQL content when present.
+        fence_match = re.search(
+            r"```(?:sql|sqlite|postgresql|mysql)?\s*(.*?)```",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        # Drop leading labels like "SQL:" or "Query:".
+        text = re.sub(r"^\s*(sql|query)\s*:\s*", "", text, flags=re.IGNORECASE)
+
+        # Keep from first SQL keyword onward if the model prepends prose.
+        kw_match = re.search(
+            r"\b(SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if kw_match:
+            text = text[kw_match.start() :]
+
+        # Keep only the first statement to avoid sqlite "one statement" errors.
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        if parts:
+            return parts[0]
+        return text.strip()
 
 
 class DualAgentSQLEngine:
@@ -149,6 +197,7 @@ class DualAgentSQLEngine:
         """Execute iterative dual-agent SQL synthesis."""
         feedback = {}
         last_sql = ""
+        last_error = ""
 
         for iteration in range(self.max_iter):
             logger.info(f"SQL generation iteration {iteration + 1}/{self.max_iter}")
@@ -163,6 +212,8 @@ class DualAgentSQLEngine:
             last_sql = sql
 
             success, result, error = self._execute(sql)
+            if error:
+                last_error = error
 
             if success and result:
                 rows = result.get("rows", [])
@@ -177,7 +228,9 @@ class DualAgentSQLEngine:
                         "success": True,
                     }
                 if self._check_fidelity(question, sql, result):
-                    logger.info(f"SQL generation succeeded at iteration {iteration + 1}")
+                    logger.info(
+                        f"SQL generation succeeded at iteration {iteration + 1}"
+                    )
                     return {
                         "sql": sql,
                         "result": result,
@@ -191,6 +244,11 @@ class DualAgentSQLEngine:
                         "result": str(result)[:200],
                     }
             else:
+                logger.warning(
+                    "SQL execution failed on iteration {}: {}",
+                    iteration + 1,
+                    error,
+                )
                 feedback = {"type": "execution_error", "sql": sql, "error": error}
 
         return {
@@ -199,6 +257,7 @@ class DualAgentSQLEngine:
             "iterations": self.max_iter,
             "success": False,
             "error": "Max iterations reached",
+            "last_error": last_error,
         }
 
     def _execute(self, sql: str) -> tuple:
@@ -206,9 +265,7 @@ class DualAgentSQLEngine:
             cursor = self.conn.cursor()
             cursor.execute(sql)
             rows = cursor.fetchall()
-            columns = (
-                [d[0] for d in cursor.description] if cursor.description else []
-            )
+            columns = [d[0] for d in cursor.description] if cursor.description else []
             return True, {"columns": columns, "rows": rows[:50]}, ""
         except Exception as e:
             return False, None, str(e)
