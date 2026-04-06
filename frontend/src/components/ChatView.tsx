@@ -5,6 +5,9 @@ import {
   User,
   Loader2,
   Volume2,
+  Pause,
+  Play,
+  Square,
   BarChart3,
   ChevronDown,
   Code2,
@@ -36,7 +39,6 @@ import type {
 } from "@/types/api";
 import { MicButton } from "@/components/voice/MicButton";
 import { VoiceTranscriptBubble } from "@/components/voice/VoiceTranscriptBubble";
-import { VoiceAudioPlayer } from "@/components/voice/VoiceAudioPlayer";
 
 // ─── Error mapping ────────────────────────────────────────────────────────────
 
@@ -187,6 +189,46 @@ function buildAIMessage(response: ChatResponse): Message {
       return { ...base, kind: "text", content: resp ?? "Done.", kpiCoverage };
     }
   }
+}
+
+function getSpeakableMessageText(msg: Message): string {
+  if (msg.role !== "ai") {
+    return "";
+  }
+
+  if (msg.kind === "text") {
+    return msg.content;
+  }
+
+  if (msg.kind === "sql") {
+    return msg.summary;
+  }
+
+  if (msg.kind === "chart") {
+    return `Here is your ${msg.chartType} chart${msg.title ? ` titled ${msg.title}` : ""}.`;
+  }
+
+  if (msg.kind === "insight") {
+    const topInsight = msg.insights[0]?.answer?.trim();
+    return topInsight ? `${msg.summary} ${topInsight}` : msg.summary;
+  }
+
+  if (msg.kind === "data_prep") {
+    return `Data preparation complete. Final shape is ${msg.shape[0]} rows by ${msg.shape[1]} columns.`;
+  }
+
+  if (msg.kind === "hybrid") {
+    const parts: string[] = [];
+    if (msg.sqlData?.answer?.trim()) {
+      parts.push(msg.sqlData.answer.trim());
+    }
+    if (msg.insightTexts?.length) {
+      parts.push(msg.insightTexts[0]);
+    }
+    return parts.join(" ").trim();
+  }
+
+  return "";
 }
 
 const STAGGER_DELAY = ["", "delay-[40ms]", "delay-[80ms]", "delay-[120ms]", "delay-[160ms]"];
@@ -386,7 +428,7 @@ function HybridCard({ msg }: { msg: HybridMessage }) {
 
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
-function MessageBubble({ msg }: { msg: Message }) {
+function MessageBubble({ msg, isSpeaking }: { msg: Message; isSpeaking: boolean }) {
   const isUser = msg.role === "user";
 
   let content: React.ReactNode;
@@ -438,10 +480,16 @@ function MessageBubble({ msg }: { msg: Message }) {
           isUser
             ? "max-w-[78%] bg-primary text-primary-foreground rounded-br-md"
             : isChartMsg
-            ? "w-full max-w-[92%] glass-card text-foreground rounded-bl-md"
-            : "max-w-[78%] glass-card text-foreground rounded-bl-md"
+            ? `w-full max-w-[92%] glass-card text-foreground rounded-bl-md ${isSpeaking ? "ring-2 ring-emerald-400/60 shadow-lg shadow-emerald-500/20" : ""}`
+            : `max-w-[78%] glass-card text-foreground rounded-bl-md ${isSpeaking ? "ring-2 ring-emerald-400/60 shadow-lg shadow-emerald-500/20" : ""}`
         }`}
       >
+        {isSpeaking && (
+          <div className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-300">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-300" />
+            Reading aloud
+          </div>
+        )}
         {content}
         {kpiCoverage && (
           <div className="mt-4">
@@ -483,24 +531,80 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [progressStep, setProgressStep] = useState(-1);
+  const [speakingMessageId, setSpeakingMessageId] = useState<number | null>(null);
+  const [isSpeechPaused, setIsSpeechPaused] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const stepTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const lastNarratedIdRef = useRef<number | null>(null);
   const {
     voiceState,
     error: voiceError,
     partialTranscript,
-    spokenAudio,
-    clearSpokenAudio,
     toggleListening,
   } = useVoiceAgent({
     sessionId,
-    onResponse: (response) => {
-      setMessages((prev) => [...prev, buildAIMessage(response)]);
-      void refreshStatus();
+    onTranscript: (text) => {
+      if (!text.trim()) {
+        return;
+      }
+      setInput(text.trim());
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(text.length, text.length);
     },
   });
-  const isVoiceActive = ["listening", "transcribing", "processing", "speaking"].includes(voiceState);
+  const isVoiceActive = ["listening", "transcribing", "processing"].includes(voiceState);
+
+  const stopSpeech = () => {
+    if (!window.speechSynthesis) {
+      return;
+    }
+    window.speechSynthesis.cancel();
+    utteranceRef.current = null;
+    setSpeakingMessageId(null);
+    setIsSpeechPaused(false);
+  };
+
+  const toggleSpeechPause = () => {
+    if (!window.speechSynthesis || speakingMessageId === null) {
+      return;
+    }
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+      setIsSpeechPaused(false);
+      return;
+    }
+    window.speechSynthesis.pause();
+    setIsSpeechPaused(true);
+  };
+
+  const speakMessage = (messageId: number, text: string) => {
+    if (!window.speechSynthesis || !text.trim()) {
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.onstart = () => {
+      setSpeakingMessageId(messageId);
+      setIsSpeechPaused(false);
+    };
+    utterance.onend = () => {
+      setSpeakingMessageId((current) => (current === messageId ? null : current));
+      setIsSpeechPaused(false);
+      utteranceRef.current = null;
+    };
+    utterance.onerror = () => {
+      setSpeakingMessageId((current) => (current === messageId ? null : current));
+      setIsSpeechPaused(false);
+      utteranceRef.current = null;
+    };
+    utteranceRef.current = utterance;
+    window.speechSynthesis.speak(utterance);
+  };
 
   // Restore messages from sessionStorage when sessionId becomes available
   useEffect(() => {
@@ -584,6 +688,30 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
   }, [messages, loading]);
 
   useEffect(() => {
+    const latestAi = [...messages].reverse().find((msg) => msg.role === "ai");
+    if (!latestAi || latestAi.id === lastNarratedIdRef.current) {
+      return;
+    }
+
+    const narration = getSpeakableMessageText(latestAi).trim();
+    if (!narration) {
+      lastNarratedIdRef.current = latestAi.id;
+      return;
+    }
+
+    lastNarratedIdRef.current = latestAi.id;
+    speakMessage(latestAi.id, narration);
+  }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (quickMessage && !loading) {
       handleSend(quickMessage);
       onQuickMessageConsumed?.();
@@ -609,6 +737,8 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
   const handleSend = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim();
     if (!text || loading) return;
+
+    stopSpeech();
 
     const userMsg: Message = { id: Date.now(), role: "user", kind: "text", content: text };
     setMessages((prev) => [...prev, userMsg]);
@@ -639,8 +769,6 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
 
   return (
     <div className="flex flex-col h-full">
-      <VoiceAudioPlayer audio={spokenAudio} onConsumed={clearSpokenAudio} />
-
       {/* Context counter */}
       {status && status.message_count > 0 && (
         <div className="flex justify-center pt-3">
@@ -653,7 +781,7 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-6 py-6 space-y-4">
         {messages.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} />
+          <MessageBubble key={msg.id} msg={msg} isSpeaking={msg.id === speakingMessageId} />
         ))}
 
         {loading && (
@@ -745,6 +873,12 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
                 Speaking
               </span>
             )}
+            {speakingMessageId !== null && (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2 py-0.5 text-emerald-300 border border-emerald-500/20">
+                <Volume2 size={10} className={isSpeechPaused ? "" : "animate-pulse"} />
+                {isSpeechPaused ? "Speech paused" : "Speech playing"}
+              </span>
+            )}
           </div>
 
           {voiceError ? (
@@ -752,11 +886,33 @@ const ChatView = ({ quickMessage, onQuickMessageConsumed }: ChatViewProps) => {
               {voiceError}
             </span>
           ) : (
-            <span className="text-muted-foreground/70 text-right">
-              {voiceState === "idle"
-                ? "Tap the mic to ask a question with your voice."
-                : "Voice input is active. The response will appear automatically."}
-            </span>
+            <div className="flex items-center justify-end gap-2 text-right">
+              <span className="text-muted-foreground/70">
+                {voiceState === "idle"
+                  ? "Tap mic, then edit transcript in the box before sending."
+                  : "Voice input is active. Finish recording to transcribe into the box."}
+              </span>
+              {speakingMessageId !== null && (
+                <>
+                  <button
+                    type="button"
+                    onClick={toggleSpeechPause}
+                    className="inline-flex items-center gap-1 rounded-full border border-border/50 px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {isSpeechPaused ? <Play size={10} /> : <Pause size={10} />}
+                    {isSpeechPaused ? "Resume" : "Pause"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={stopSpeech}
+                    className="inline-flex items-center gap-1 rounded-full border border-border/50 px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    <Square size={10} />
+                    Stop
+                  </button>
+                </>
+              )}
+            </div>
           )}
         </div>
       </div>
